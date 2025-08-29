@@ -7,10 +7,17 @@
 #include <pthread.h>
 #include <stdlib.h> 
 #include <sys/stat.h>
+#include <dirent.h>
 
 #define PORT 8080
 #define BUFFER_SIZE 1024
+#define PATH_SIZE 4096
 #define FILE_LOC "./files"
+
+const char* not_found =
+"HTTP/1.0 404 Not Found\r\n"
+"Content-Type: text/html\r\n\r\n"
+"<h1>404 Not Found</h1>";
 
 const char* get_mime_type(const char* path) {
 
@@ -48,50 +55,157 @@ void* handle_client(void* arg) {
 
     int valread = read(newsockfd, buffer, BUFFER_SIZE);
 
-    buffer[valread] = "\0";
+    buffer[valread] = '\0';
     char method[BUFFER_SIZE], uri[BUFFER_SIZE], version[BUFFER_SIZE];
     sscanf(buffer, "%s %s %s", method, uri, version);
-    printf("[%s:%u] %s %s %s\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port), method, version, uri);
 
-    char path[BUFFER_SIZE];
+    if (strstr(uri, "..")) {
+        const char* bad = "HTTP/1.0 400 Bad Request\r\n"
+            "Content - Type: text / html\r\n\r\n"
+            "<h1>400 Bad Request</h1>";
+        write(newsockfd, bad, strlen(bad));
+        close(newsockfd);
+        return NULL;
+    }
+
+    printf("[%s:%u] %s %s %s\n",
+        inet_ntoa(client_addr.sin_addr),
+        ntohs(client_addr.sin_port),
+        method, version, uri);
+
+    char base_path[PATH_SIZE];
     if (strcmp(uri, "/") == 0) {
-        snprintf(path, sizeof(path), "%s/index.html", FILE_LOC);
+        snprintf(base_path, sizeof(base_path), "%s", FILE_LOC);
     }
     else {
-        snprintf(path, sizeof(path), "%s%s", FILE_LOC, uri);
+        snprintf(base_path, sizeof(base_path), "%s%s", FILE_LOC, uri);
     }
 
-    FILE* file = fopen(path, "rb");
-    if (file) {
-        struct stat st;
-        stat(path, &st);
-        size_t filesize = st.st_size;
+    struct stat st;
+    if (stat(base_path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            char index_path[PATH_SIZE];
+            snprintf(index_path, sizeof(index_path), "%s/index.html", base_path);
 
-        char header[BUFFER_SIZE];
-        snprintf(header, sizeof(header),
-            "HTTP/1.0 200 OK\r\n"
-            "Server: webserver-c\r\n"
-            "Content-Length: %zu\r\n"
-            "Content-Type: %s\r\n\r\n",
-            filesize, get_mime_type(path));
-        write(newsockfd, header, strlen(header));
+            FILE* index = fopen(index_path, "rb");
+            if (index) {
+                fseek(index, 0, SEEK_END);
+                size_t filesize = ftell(index);
+                rewind(index);
 
-        char filebuf[BUFFER_SIZE];
-        size_t n;
-        while ((n = fread(filebuf, 1, sizeof(filebuf), file)) > 0) {
-            write(newsockfd, filebuf, n);
+                char header[BUFFER_SIZE];
+                snprintf(header, sizeof(header),
+                    "HTTP/1.0 200 OK\r\n"
+                    "Server: webserver-c\r\n"
+                    "Content-Length: %zu\r\n"
+                    "Content-Type: text/html\r\n\r\n",
+                    filesize);
+                write(newsockfd, header, strlen(header));
+
+                char filebuf[BUFFER_SIZE];
+                size_t n;
+                while ((n = fread(filebuf, 1, sizeof(filebuf), index)) > 0) {
+                    write(newsockfd, filebuf, n);
+                }
+                fclose(index);
+            }
+            else {
+                DIR* dir = opendir(base_path);
+                if (!dir) {
+                    const char* forbidden =
+                        "HTTP/1.0 403 Forbidden\r\n"
+                        "Server: webserver-c\r\n"
+                        "Content-Type: text/html\r\n\r\n"
+                        "<h1>403 Forbidden</h1>";
+                    write(newsockfd, forbidden, strlen(forbidden));
+                }
+                else {
+                    const char* hdr =
+                        "HTTP/1.0 200 OK\r\n"
+                        "Server: webserver-c\r\n"
+                        "Content-Type: text/html\r\n\r\n";
+                    write(newsockfd, hdr, strlen(hdr));
+
+                    const char* head = "<html><body><h1>Directory listing</h1><ul>";
+                    write(newsockfd, head, strlen(head));
+
+                    if (strcmp(uri, "/") != 0) {
+                        char parent[PATH_SIZE];
+                        strncpy(parent, uri, sizeof(parent));
+                        parent[sizeof(parent) - 1] = '\0';
+                        size_t len = strlen(parent);
+                        if (len > 1 && parent[len - 1] == '/') parent[len - 1] = '\0';
+                        char* slash = strrchr(parent, '/');
+                        if (slash && slash != parent) *(slash + 1) = '\0';
+                        else strcpy(parent, "/");
+
+                        char up[PATH_SIZE];
+                        snprintf(up, sizeof(up), "<li><a href=\"%s\">..</a></li>", parent);
+                        write(newsockfd, up, strlen(up));
+                    }
+
+                    struct dirent* entry;
+                    while ((entry = readdir(dir)) != NULL) {
+                        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+                            continue;
+
+                        char full_uri[PATH_SIZE];
+                        if (uri[strlen(uri) - 1] == '/')
+                            snprintf(full_uri, sizeof(full_uri), "%s%s", uri, entry->d_name);
+                        else
+                            snprintf(full_uri, sizeof(full_uri), "%s/%s", uri, entry->d_name);
+
+                        char line[PATH_SIZE];
+                        snprintf(line, sizeof(line),
+                            "<li><a href=\"%s\">%s</a></li>",
+                            full_uri, entry->d_name);
+                        write(newsockfd, line, strlen(line));
+                    }
+                    closedir(dir);
+
+                    const char* tail = "</ul></body></html>";
+                    write(newsockfd, tail, strlen(tail));
+                }
+            }
         }
-        fclose(file);
-    } else {
-        char* not_found = "HTTP/1.0 404 Not Found\r\n"
-            "Server: webserver-c\r\n"
-            "Content-type: text/html\r\n\r\n"
-            "<html>File not found</html>\r\n";
+        else if (S_ISREG(st.st_mode)) {
+            FILE* file = fopen(base_path, "rb");
+            if (file) {
+                size_t filesize = st.st_size;
+
+                char header[BUFFER_SIZE];
+                snprintf(header, sizeof(header),
+                    "HTTP/1.0 200 OK\r\n"
+                    "Server: webserver-c\r\n"
+                    "Content-Length: %zu\r\n"
+                    "Content-Type: %s\r\n\r\n",
+                    filesize, get_mime_type(base_path));
+                write(newsockfd, header, strlen(header));
+
+                char filebuf[BUFFER_SIZE];
+                size_t n;
+                while ((n = fread(filebuf, 1, sizeof(filebuf), file)) > 0) {
+                    write(newsockfd, filebuf, n);
+                }
+                fclose(file);
+            }
+            else {
+                const char* err =
+                    "HTTP/1.0 500 Internal Server Error\r\n"
+                    "Content-Type: text/html\r\n\r\n"
+                    "<h1>500 Internal Server Error</h1>";
+                write(newsockfd, err, strlen(err));
+            }
+        }
+        else {
+            write(newsockfd, not_found, strlen(not_found));
+        }
+    }
+    else {
         write(newsockfd, not_found, strlen(not_found));
     }
-    close(newsockfd);
-    return NULL;
 }
+
     
 
 int main() {
@@ -125,12 +239,13 @@ int main() {
     for (;;) {
 
         int* newsockfd = malloc(sizeof(int));
-        *newsockfd = accept(sockfd, (struct sockaddr*)&host_addr, (socklen_t*)&host_addrlen);
-        if (newsockfd < 0) {
+        *newsockfd = accept(sockfd, (struct sockaddr*)&client_addr, (socklen_t*)&client_addrlen);
+        if (*newsockfd < 0) {
             perror("webserver (accept)");
             free(newsockfd);
             continue;
         }
+
 
         printf("Connection accepted\n");
 
